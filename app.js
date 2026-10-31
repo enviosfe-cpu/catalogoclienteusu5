@@ -19,7 +19,10 @@ function directImageUrl(u) {
 function normalizeCatalogImages(cat) {
   if (!cat) return;
   if (cat.company && cat.company.logo) cat.company.logo = directImageUrl(cat.company.logo);
-  (cat.products || []).forEach(p => { if (p.image) p.image = directImageUrl(p.image); });
+  (cat.products || []).forEach(p => {
+    if (p.image) p.image = directImageUrl(p.image);
+    p.barcode = String(p.barcode || p.det_codbar || '').trim();
+  });
   if (cat.offer && cat.offer.image) {
     cat.offer.image = String(cat.offer.image).split(/[,\n]+/).map(s => directImageUrl(s.trim())).filter(Boolean).join(',');
   }
@@ -48,6 +51,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (raw) state.cart = JSON.parse(raw) || {};
   } catch (e) {}
 
+  // Limpiar bandera de sesión previa para que la alerta emergente abra siempre al iniciar la app
+  try { sessionStorage.removeItem(`cc_offer_closed_${state.vendor}`); } catch (e) {}
+
   // 1. CARGA INMEDIATA OFFLINE (0 ms de espera)
   loadCatalogOfflineFirst();
 
@@ -65,6 +71,59 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   });
 });
+
+let syncToastTimer = null;
+
+function showSyncToast(title, msg, spinning = true) {
+  const toast = document.getElementById('cc-sync-toast');
+  const titleEl = document.getElementById('cc-sync-title');
+  const msgEl = document.getElementById('cc-sync-msg');
+  const icon = document.getElementById('cc-sync-icon');
+  const iconWrap = icon?.parentElement;
+  if (!toast) return;
+
+  if (syncToastTimer) {
+    clearTimeout(syncToastTimer);
+    syncToastTimer = null;
+  }
+
+  if (titleEl) titleEl.textContent = title;
+  if (msgEl) msgEl.textContent = msg;
+
+  if (icon && iconWrap) {
+    iconWrap.className = 'cc-sync-toast-icon';
+    if (spinning) {
+      icon.className = 'fa-solid fa-arrows-rotate fa-spin';
+    } else {
+      icon.className = 'fa-solid fa-circle-check';
+      iconWrap.classList.add('is-success');
+    }
+  }
+
+  toast.classList.remove('hidden', 'is-leaving');
+}
+
+function hideSyncToast(delay = 0) {
+  const toast = document.getElementById('cc-sync-toast');
+  if (!toast) return;
+
+  if (syncToastTimer) {
+    clearTimeout(syncToastTimer);
+    syncToastTimer = null;
+  }
+
+  if (delay > 0) {
+    syncToastTimer = setTimeout(() => {
+      toast.classList.add('is-leaving');
+      syncToastTimer = setTimeout(() => {
+        toast.classList.add('hidden');
+        toast.classList.remove('is-leaving');
+      }, 250);
+    }, delay);
+  } else {
+    toast.classList.add('hidden');
+  }
+}
 
 /**
  * Carga Local-First: lee únicamente del almacenamiento local guardado.
@@ -97,12 +156,10 @@ function loadCatalogOfflineFirst() {
     return true;
   }
 
-  // Si no hay datos en caché, mostrar estado vacío / cargando según corresponda
-  if (empty) {
-    const msg = document.getElementById('cc-empty-msg');
-    if (msg) msg.textContent = "No hay productos disponibles en caché local. Conéctate para sincronizar.";
-    empty.classList.remove('hidden');
-  }
+  // Si no hay datos en caché o se limpió la caché: mostrar el cuadrito de actualización
+  showSyncToast("Estamos actualizando", "Espera un momento, estamos preparando el catálogo…", true);
+  if (loading) loading.classList.remove('hidden');
+  if (empty) empty.classList.add('hidden');
   return false;
 }
 
@@ -131,6 +188,11 @@ async function syncCatalogInBackground() {
     renderGrid();
     updateCartBadge();
     maybeOffer();
+
+    // Cuando termina de cargar y guardar la caché, avisar y quitar el cuadrito
+    showSyncToast("¡Catálogo listo!", "Productos cargados y guardados en este equipo.", false);
+    hideSyncToast(1200);
+
   } catch (e) {
     // Si falla en background o no hay internet, no pasa nada porque ya tenemos datos offline
     console.log("Catálogo en modo local / offline:", e.message || e);
@@ -139,6 +201,9 @@ async function syncCatalogInBackground() {
       const msg = document.getElementById('cc-empty-msg');
       if (msg) msg.textContent = "Catálogo listo para operar offline. Conéctate una vez si requieres actualizar.";
       document.getElementById('cc-empty')?.classList.remove('hidden');
+      hideSyncToast(0);
+    } else {
+      hideSyncToast(0);
     }
   } finally {
     state.isSyncing = false;
@@ -158,6 +223,7 @@ async function refreshCatalogManually() {
     return;
   }
 
+  showSyncToast("Estamos actualizando", "Descargando la última versión del catálogo…", true);
   try {
     await syncCatalogInBackground();
   } finally {
@@ -195,15 +261,36 @@ function applyBrand() {
   const hl = document.getElementById('cc-headline');
   if (hl) {
     let html = seller.headline ? `<span>${seller.headline}</span>` : '';
-    if (offer && offer.enabled && offer.image) {
+    if (isOfferActive(offer)) {
       html += `
-        <button onclick="openOffer()" class="inline-flex items-center gap-1.5 ml-2 px-2.5 py-1 rounded-lg bg-amber-500/10 text-amber-600 text-xs font-bold hover:bg-amber-500/20 active:scale-95 transition">
-          <i class="fa-solid fa-fire text-amber-500"></i> Ver oferta
+        <button onclick="openOffer()" class="cc-hero-offer-link">
+          <span class="cc-dot-red"></span>Ver oferta
         </button>`;
     }
     hl.innerHTML = html;
   }
-  
+
+  // Portada: selección curada de fotos reales del catálogo.
+  // Se priorizan fotos con fondo claro para que la mezcla con el marco crema sea limpia.
+  const hero = document.getElementById('cc-hero');
+  const withImages = (c.products || []).filter(p => p.image);
+  const heroProducts = [withImages[3], withImages[0], withImages[4]].filter(Boolean);
+  [1, 2, 3].forEach((n, i) => {
+    const frame = document.getElementById(`cc-hero-frame-${n}`);
+    const img = document.getElementById(`cc-hero-img-${n}`);
+    if (!frame || !img) return;
+    const p = heroProducts[i];
+    if (!p) { frame.style.display = 'none'; return; }
+    frame.style.display = '';
+    img.src = p.image;
+    img.alt = p.name || '';
+    img.onerror = () => { frame.style.display = 'none'; };
+  });
+  if (hero) hero.classList.toggle('cc-hero-no-stage', heroProducts.length === 0);
+
+  const seal = document.getElementById('cc-hero-offer');
+  if (seal) seal.classList.toggle('hidden', !isOfferActive(offer));
+
   const send = document.getElementById('cc-send-label');
   if (send && seller.name) send.textContent = `Enviar a ${seller.name} por WhatsApp`;
 }
@@ -217,6 +304,10 @@ function openOffer() {
   const cta = document.getElementById('cc-offer-cta');
   
   if (img) {
+    img.onerror = () => {
+      if (modal) modal.classList.add('hidden');
+      document.body.style.overflow = '';
+    };
     state.offerImages = parseOfferImages(offer.image);
     state.offerIdx = 0;
     showOfferImage();
@@ -243,44 +334,98 @@ function parseOfferImages(raw) {  return String(raw || '')
     });
 }
 
+// Normaliza texto para búsqueda tolerante a mayúsculas, minúsculas y tildes
+function normStr(str) {
+  return String(str || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim();
+}
+
+function clearClientSearch() {
+  const input = document.getElementById('cc-search');
+  if (input) input.value = '';
+  renderGrid();
+}
+
 function renderGrid() {
   const grid = document.getElementById('cc-grid');
   const empty = document.getElementById('cc-empty');
+  const emptyMsg = document.getElementById('cc-empty-msg');
+  const count = document.getElementById('cc-grid-count');
   if (!grid || !state.catalog) return;
-  const q = (document.getElementById('cc-search')?.value || '').toLowerCase().trim();
+
+  const rawQ = (document.getElementById('cc-search')?.value || '').trim();
+  const clearBtn = document.getElementById('cc-search-clear');
+  if (clearBtn) {
+    if (rawQ) clearBtn.classList.remove('hidden');
+    else clearBtn.classList.add('hidden');
+  }
+
+  const q = normStr(rawQ);
   const items = (state.catalog.products || []).filter(p => {
     if (!q) return true;
-    return String(p.name || '').toLowerCase().includes(q) || String(p.code || '').toLowerCase().includes(q);
+    const nameMatch = normStr(p.name).includes(q);
+    const codeMatch = normStr(p.code).includes(q);
+    const barcodeMatch = normStr(p.barcode || p.det_codbar).includes(q);
+    const catMatch = normStr(p.categoryName || p.category).includes(q);
+    const supMatch = normStr(p.supplierName || p.supplier).includes(q);
+    return nameMatch || codeMatch || barcodeMatch || catMatch || supMatch;
   });
+
+  if (count) count.textContent = `${items.length} producto${items.length === 1 ? '' : 's'}`;
+
   if (!items.length) {
     grid.innerHTML = '';
+    if (emptyMsg) {
+      emptyMsg.textContent = rawQ
+        ? `No encontramos productos para “${rawQ}”.`
+        : 'Aún no hay productos publicados.';
+    }
     if (empty) empty.classList.remove('hidden');
     return;
   }
   if (empty) empty.classList.add('hidden');
-  grid.innerHTML = items.map(p => {
+  grid.innerHTML = items.map((p, i) => {
     const qty = state.cart[p.code] || 0;
-    const sub = [p.supplierName || p.supplier, p.categoryName || p.category].filter(Boolean).join(' • ');
+    const sub = [p.supplierName || p.supplier, p.categoryName || p.category].filter(Boolean).join(' · ');
+    const image = p.image
+      ? `<img src="${p.image}" alt="${p.name}" loading="lazy" onerror="this.style.display='none';this.parentElement.querySelector('.cc-card-fallback').style.display='grid'">`
+      : '';
+    const fallbackStyle = p.image ? ' style="display:none"' : '';
     return `
-    <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs flex flex-col overflow-hidden">
-      <div class="w-full aspect-square bg-slate-50 border-b border-slate-100 flex items-center justify-center overflow-hidden">
-        ${p.image ? `<img src="${p.image}" alt="${p.name}" loading="lazy" onerror="this.outerHTML='<i class=\\\'fa-solid fa-box text-3xl text-slate-300\\\'></i>'" class="w-full h-full object-contain p-2">` : `<i class="fa-solid fa-box text-3xl text-slate-300"></i>`}
+    <article class="cc-card" style="--d:${Math.min(i * 28, 220)}ms">
+      <div class="cc-card-media">
+        ${image}
+        <span class="cc-card-fallback"${fallbackStyle}><i class="fa-solid fa-box"></i></span>
+        <span class="cc-code">#${p.code}</span>
       </div>
-      <div class="p-3 flex-1 flex flex-col">
-        <span class="text-[10px] font-bold text-blue-700">#${p.code}</span>
-        <h4 class="text-xs font-bold text-slate-800 line-clamp-2 leading-snug">${p.name}</h4>
-        ${sub ? `<div class="text-[10px] text-slate-400 truncate mt-0.5">${sub}</div>` : ''}
-        <div class="mt-2 pt-2 border-t border-slate-100 flex items-center justify-between">
+      <div class="cc-card-body">
+        ${p.barcode ? `
+          <div class="cc-card-barcode" title="Código de barras: ${p.barcode}">
+            <i class="fa-solid fa-barcode" aria-hidden="true"></i>
+            <span>${p.barcode}</span>
+          </div>
+        ` : ''}
+        <h3>${p.name}</h3>
+        ${sub ? `<div class="cc-card-meta">${sub}</div>` : ''}
+        <div class="cc-card-foot">
           ${qty > 0 ? `
-          <div class="flex items-center gap-2">
-            <button onclick="changeQty('${p.code}', -1)" class="w-9 h-9 rounded-lg bg-slate-100 text-slate-700 font-bold">−</button>
-            <span class="text-sm font-extrabold w-5 text-center">${qty}</span>
-            <button onclick="changeQty('${p.code}', 1)" class="w-9 h-9 rounded-lg bg-slate-100 text-slate-700 font-bold">+</button>
+          <div class="cc-qty">
+            <span class="cc-qty-label">En consulta</span>
+            <div class="cc-qty-controls">
+              <button onclick="changeQty('${p.code}', -1)" aria-label="Quitar una unidad">−</button>
+              <span>${qty}</span>
+              <button onclick="changeQty('${p.code}', 1)" aria-label="Agregar una unidad">+</button>
+            </div>
           </div>` : `
-          <button onclick="changeQty('${p.code}', 1)" class="px-3 py-2 rounded-lg bg-blue-600 active:bg-blue-700 text-white text-xs font-bold w-full text-center">Agregar</button>`}
+          <button class="cc-card-add" onclick="changeQty('${p.code}', 1)" aria-label="Agregar producto">
+            <span>Agregar</span><i class="fa-solid fa-plus"></i>
+          </button>`}
         </div>
       </div>
-    </div>`;
+    </article>`;
   }).join('');
 }
 
@@ -291,12 +436,32 @@ function changeQty(code, delta) {
   try { localStorage.setItem('cc_cart_' + state.vendor, JSON.stringify(state.cart)); } catch (e) {}
   updateCartBadge();
   renderGrid();
+
+  if (delta > 0) {
+    const bottomBtn = document.querySelector('.cc-bottombar-btn');
+    if (bottomBtn) {
+      bottomBtn.classList.remove('cc-pulse');
+      void bottomBtn.offsetWidth;
+      bottomBtn.classList.add('cc-pulse');
+    }
+  }
 }
 
 function updateCartBadge() {
   const n = Object.values(state.cart).reduce((a, b) => a + b, 0);
+  const total = `${n} producto${n === 1 ? '' : 's'}`;
+
   const el = document.getElementById('cart-count');
   if (el) el.textContent = String(n);
+
+  const barCount = document.getElementById('cc-bottombar-count');
+  if (barCount) barCount.textContent = String(n);
+
+  const barLabel = document.getElementById('cc-bottombar-label');
+  if (barLabel) barLabel.textContent = total;
+
+  const cartCount = document.getElementById('cc-cart-count');
+  if (cartCount) cartCount.textContent = `${total} en tu consulta`;
 }
 
 function toggleCart(open) {
@@ -304,6 +469,7 @@ function toggleCart(open) {
   if (!m) return;
   if (open) renderCart();
   m.classList.toggle('hidden', !open);
+  document.body.style.overflow = open ? 'hidden' : '';
 }
 
 function renderCart() {
@@ -315,22 +481,28 @@ function renderCart() {
     qty: state.cart[code]
   })).filter(x => x.p && x.qty > 0);
   if (!entries.length) {
-    box.innerHTML = `<p class="text-xs text-slate-400 text-center p-6">Tu consulta está vacía. Agrega productos del catálogo.</p>`;
+    box.innerHTML = `
+      <div class="cc-cart-empty">
+        <i class="fa-solid fa-bag-shopping"></i>
+        <b>Tu consulta está vacía</b>
+        <p>Agrega productos del catálogo para enviarlos por WhatsApp.</p>
+      </div>`;
     return;
   }
   box.innerHTML = entries.map(({ p, qty }) => `
-    <div class="p-3 flex items-center gap-3">
-      <div class="w-12 h-12 rounded-lg bg-slate-50 overflow-hidden shrink-0 flex items-center justify-center">
-        ${p.image ? `<img src="${p.image}" onerror="this.outerHTML='<i class=\\\'fa-solid fa-box text-slate-300\\\'></i>'" class="w-full h-full object-contain">` : `<i class="fa-solid fa-box text-slate-300"></i>`}
+    <div class="cc-cart-item">
+      <div class="cc-cart-thumb">
+        <i class="fa-solid fa-box"></i>
+        ${p.image ? `<img src="${p.image}" alt="${p.name}" onerror="this.style.display='none'">` : ''}
       </div>
-      <div class="flex-1 min-w-0">
-        <div class="text-xs font-bold text-slate-900 truncate">${p.name}</div>
-        <div class="text-[10px] text-slate-400">#${p.code}</div>
+      <div class="cc-cart-info">
+        <b>${p.name}</b>
+        <span>#${p.code}${p.barcode ? ` · <i class="fa-solid fa-barcode"></i> ${p.barcode}` : ''}</span>
       </div>
-      <div class="flex items-center gap-1.5 shrink-0">
-        <button onclick="changeQty('${p.code}', -1);renderCart()" class="w-8 h-8 rounded-lg bg-slate-100 font-bold">−</button>
-        <span class="text-xs font-extrabold w-4 text-center">${qty}</span>
-        <button onclick="changeQty('${p.code}', 1);renderCart()" class="w-8 h-8 rounded-lg bg-slate-100 font-bold">+</button>
+      <div class="cc-cart-qty">
+        <button onclick="changeQty('${p.code}', -1);renderCart()" aria-label="Quitar una unidad">−</button>
+        <span>${qty}</span>
+        <button onclick="changeQty('${p.code}', 1);renderCart()" aria-label="Agregar una unidad">+</button>
       </div>
     </div>`).join('');
 }
@@ -345,7 +517,7 @@ function sendOrder() {
   const prods = state.catalog.products || [];
   const lines = Object.keys(state.cart).map(code => {
     const p = prods.find(x => String(x.code) === String(code));
-    return p ? `• ${state.cart[code]} x ${p.name} (#${p.code})` : null;
+    return p ? `• ${state.cart[code]} x ${p.name} (#${p.code}${p.barcode ? ` · Barra: ${p.barcode}` : ''})` : null;
   }).filter(Boolean);
   if (!lines.length) {
     alert("Agrega productos antes de enviar.");
@@ -355,41 +527,35 @@ function sendOrder() {
   window.open(`https://wa.me/${wa}?text=${msg}`, "_blank");
 }
 
+function isOfferActive(offer) {
+  if (!offer || !offer.enabled || !offer.image) return false;
+  const nowMs = Date.now();
+  if (offer.start) {
+    const s = new Date(offer.start).getTime();
+    if (!isNaN(s) && nowMs < s) return false;
+  }
+  if (offer.end) {
+    const e = new Date(offer.end);
+    if (!isNaN(e.getTime())) {
+      e.setHours(23, 59, 59, 999);
+      if (nowMs > e.getTime()) return false;
+    }
+  }
+  return true;
+}
+
 function maybeOffer() {
   const offer = state.catalog && state.catalog.offer;
-  if (!offer || !offer.enabled || !offer.image) return;
+  if (!isOfferActive(offer)) return;
 
-  // Validación de vigencia de fechas si están definidas
-  const todayStr = new Date().toISOString().slice(0, 10);
-  if (offer.start && todayStr < offer.start) return;
-  if (offer.end && todayStr > offer.end) return;
+  // Solo mostrar una vez por apertura/carga de la app (evita reapertura en segundo plano)
+  if (state.offerShownThisLoad) return;
+  state.offerShownThisLoad = true;
 
-  // Evitar reabrirlo en la misma sesión si el usuario ya lo cerró
-  if (sessionStorage.getItem(`cc_offer_closed_${state.vendor}`)) return;
-
-  const modal = document.getElementById('cc-offer');
-  const img = document.getElementById('cc-offer-image');
-  const t = document.getElementById('cc-offer-title');
-  const cta = document.getElementById('cc-offer-cta');
-
-  if (img) {
-    state.offerImages = parseOfferImages(offer.image);
-    state.offerIdx = 0;
-    showOfferImage();
-    img.onerror = () => {
-      // Si la URL de la imagen falla o no carga, ocultar el modal para no bloquear al usuario
-      if (modal) modal.classList.add('hidden');
-    };
-    enableOfferSwipe();
-  }
-  if (t) t.textContent = offer.title || 'Oferta especial';
-  if (cta) cta.textContent = offer.cta || 'Ver productos';
-
-  if (modal) {
-    modal.classList.remove('hidden');
-    // Prevenir scroll en el fondo mientras el modal está abierto
-    document.body.style.overflow = 'hidden';
-  }
+  // Desplegar la alerta emergente automáticamente
+  setTimeout(() => {
+    openOffer();
+  }, 250);
 }
 
 function showOfferImage() {
@@ -415,7 +581,7 @@ function showOfferImage() {
   const dots = document.getElementById('cc-offer-dots');
   if (dots) {
     dots.innerHTML = multi ? imgs.map((_, i) =>
-      `<button onclick="showOfferAt(${i})" aria-label="Imagen ${i + 1}" class="h-2 rounded-full transition-all duration-200 ${i === state.offerIdx ? 'w-6 bg-white shadow-sm' : 'w-2 bg-white/50 hover:bg-white/80'}"></button>`
+      `<button onclick="showOfferAt(${i})" aria-label="Imagen ${i + 1}" class="cc-dot${i === state.offerIdx ? ' cc-dot-active' : ''}"></button>`
     ).join('') : '';
   }
 }
@@ -450,8 +616,167 @@ function closeOffer() {
   const modal = document.getElementById('cc-offer');
   if (modal) modal.classList.add('hidden');
   document.body.style.overflow = '';
-  // Marcar como cerrado en esta sesión para no ser molesto al navegar
+}
+
+/**
+ * Escáner de Código de Barras (Cámara + Detección automática para Catálogo Cliente)
+ */
+let clientBarcodeScanner = null;
+let clientScannerCameras = [];
+let clientCurrentCameraIdx = 0;
+let clientIsTorchOn = false;
+
+function playClientScannerBeep() {
   try {
-    sessionStorage.setItem(`cc_offer_closed_${state.vendor}`, "1");
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(880, ctx.currentTime);
+    gain.gain.setValueAtTime(0.18, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.12);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.12);
   } catch (e) {}
+}
+
+async function openBarcodeScanner() {
+  const modal = document.getElementById('cc-scanner-modal');
+  if (!modal) return;
+  modal.classList.remove('hidden');
+  document.body.style.overflow = 'hidden';
+
+  const statusEl = document.getElementById('cc-scanner-status');
+  if (statusEl) statusEl.textContent = 'Iniciando cámara...';
+
+  if (typeof Html5Qrcode === 'undefined') {
+    if (statusEl) statusEl.textContent = 'Módulo de cámara listo.';
+  }
+
+  try {
+    if (!clientBarcodeScanner) {
+      clientBarcodeScanner = new Html5Qrcode("cc-scanner-viewport", {
+        experimentalFeatures: {
+          useBarCodeDetectorIfSupported: true
+        }
+      });
+    }
+
+    try {
+      clientScannerCameras = await Html5Qrcode.getCameras();
+    } catch (e) {
+      clientScannerCameras = [];
+    }
+
+    const switchBtn = document.getElementById('cc-scanner-switch');
+    if (switchBtn) {
+      switchBtn.classList.toggle('hidden', clientScannerCameras.length <= 1);
+    }
+
+    const config = {
+      fps: 15,
+      qrbox: { width: 260, height: 160 },
+      aspectRatio: 1.0
+    };
+
+    const cameraConfig = clientScannerCameras.length > 0
+      ? { deviceId: { exact: clientScannerCameras[clientCurrentCameraIdx].id } }
+      : { facingMode: "environment" };
+
+    await clientBarcodeScanner.start(
+      cameraConfig,
+      config,
+      onClientBarcodeScanned,
+      onClientBarcodeScanError
+    );
+
+    if (statusEl) statusEl.textContent = 'Apunta la cámara al código de barra';
+
+    const torchBtn = document.getElementById('cc-scanner-torch');
+    if (torchBtn) {
+      try {
+        const capabilities = clientBarcodeScanner.getRunningTrackCapabilities?.();
+        torchBtn.classList.toggle('hidden', !capabilities?.torch);
+      } catch (e) {
+        torchBtn.classList.add('hidden');
+      }
+    }
+
+  } catch (err) {
+    console.error("Error al iniciar escáner cliente:", err);
+    if (statusEl) {
+      statusEl.textContent = 'No se pudo acceder a la cámara. Revisa los permisos.';
+    }
+  }
+}
+
+function onClientBarcodeScanned(decodedText) {
+  const code = String(decodedText || '').trim();
+  if (!code) return;
+
+  playClientScannerBeep();
+  if (navigator.vibrate) {
+    try { navigator.vibrate([60, 40, 60]); } catch (e) {}
+  }
+
+  closeBarcodeScanner();
+
+  const searchInput = document.getElementById('cc-search');
+  if (searchInput) {
+    searchInput.value = code;
+    renderGrid();
+    searchInput.focus();
+    searchInput.select();
+  }
+
+  const gridSection = document.getElementById('cc-grid-section');
+  if (gridSection) {
+    gridSection.scrollIntoView({ behavior: 'smooth' });
+  }
+}
+
+function onClientBarcodeScanError() {
+  // Búsqueda frame a frame
+}
+
+async function closeBarcodeScanner() {
+  const modal = document.getElementById('cc-scanner-modal');
+  if (modal) modal.classList.add('hidden');
+  document.body.style.overflow = '';
+
+  if (clientBarcodeScanner) {
+    try {
+      if (clientBarcodeScanner.isScanning) {
+        await clientBarcodeScanner.stop();
+      }
+    } catch (e) {}
+  }
+  clientIsTorchOn = false;
+  const torchBtn = document.getElementById('cc-scanner-torch');
+  if (torchBtn) torchBtn.classList.remove('is-active');
+}
+
+async function toggleScannerTorch() {
+  if (!clientBarcodeScanner || !clientBarcodeScanner.isScanning) return;
+  try {
+    clientIsTorchOn = !clientIsTorchOn;
+    await clientBarcodeScanner.applyVideoConstraints({
+      advanced: [{ torch: clientIsTorchOn }]
+    });
+    const torchBtn = document.getElementById('cc-scanner-torch');
+    if (torchBtn) torchBtn.classList.toggle('is-active', clientIsTorchOn);
+  } catch (e) {
+    console.warn("Torch no soportado:", e);
+  }
+}
+
+async function switchScannerCamera() {
+  if (clientScannerCameras.length <= 1 || !clientBarcodeScanner) return;
+  clientCurrentCameraIdx = (clientCurrentCameraIdx + 1) % clientScannerCameras.length;
+  await closeBarcodeScanner();
+  await openBarcodeScanner();
 }
